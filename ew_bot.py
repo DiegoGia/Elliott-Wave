@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Elliott Wave [LuxAlgo] -> alertas a Telegram (datos de Binance, sin login).
+
+Cuatro señales posibles, siempre con la posicion del simbolo respecto a la vela:
+    ○ CIRCULO ARRIBA   ○ CIRCULO ABAJO   ✕ CRUZ ARRIBA   ✕ CRUZ ABAJO
+
+Sin repintado: cada señal se calcula solo con velas CERRADAS, se envia una vez y
+nunca se borra ni se mueve. Un pivote solo se usa cuando ya esta confirmado.
+
+Uso:
+    python ew_bot.py test     -> prueba Telegram y Binance
+    python ew_bot.py --once   -> una pasada y termina (GitHub Actions)
+    python ew_bot.py          -> corre en continuo (PC o servidor)
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+import requests
+
+# ===================== CONFIGURACION =====================
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "PEGA_AQUI_EL_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT", "PEGA_AQUI_TU_CHAT_ID")
+
+MARKET = os.getenv("MARKET", "spot")           # "spot" o "futures" (futures suele dar 451 en GitHub)
+TOP_N = 30                                     # top por volumen 24h (par USDT)
+SYMBOLS = []                                   # vacio = automatico. O fija: ["BTCUSDT", "ETHUSDT"]
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]   # 1w = semanal
+LENGTHS = [4, 8, 16]                           # grados del zigzag (rojo, azul, blanco)
+FIB = 0.854                                    # limite de la correccion ABC (nivel 4 del indicador)
+SEND_CROSSES = True                            # False = solo circulos
+TZ = "UTC"                                     # zona horaria de los mensajes, ej. "America/New_York"
+CANDLES = 1000                                 # velas por consulta (maximo de Binance)
+POLL_SECONDS = 60                              # solo en modo continuo
+STATE_FILE = "ew_state.json"
+# =========================================================
+
+TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
+         "4h": 14_400_000, "1d": 86_400_000, "1w": 604_800_000}
+WEEK_OFFSET = 4 * 86_400_000                   # las velas semanales abren el lunes 00:00 UTC
+STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "EUR", "EURI", "AEUR",
+           "PYUSD", "USD1", "USDE", "XUSD", "BFUSD", "RLUSD", "UST", "GBP", "TRY", "BRL"}
+DEGREE_COLOR = {4: "rojo", 8: "azul", 16: "blanco"}
+
+
+# ------------------------------------------------------------------
+#  Motor Elliott (port de la logica del indicador, solo lo necesario para las señales)
+# ------------------------------------------------------------------
+class Event(NamedTuple):
+    bar: int       # vela cuyo cierre dispara la señal
+    mark: int      # vela donde TradingView dibuja el simbolo
+    kind: str      # "circle" | "cross"
+    side: int      # +1 arriba de la vela | -1 debajo de la vela
+    level: float
+
+
+def is_pivot_high(h, i, left):
+    """Pivote en la vela i-1 confirmado por la vela i (como ta.pivothigh(x, left, 1))."""
+    p = i - 1
+    if p < left:
+        return False
+    v = h[p]
+    return v > h[i] and all(v > h[p - k] for k in range(1, left + 1))
+
+
+def is_pivot_low(l, i, left):
+    p = i - 1
+    if p < left:
+        return False
+    v = l[p]
+    return v < l[i] and all(v < l[p - k] for k in range(1, left + 1))
+
+
+class Degree:
+    """Un grado del zigzag (len 4, 8 o 16). Alcista y bajista comparten codigo (s = +1 / -1)."""
+
+    def __init__(self, left):
+        self.left = left
+        self.zz = []       # [dir, x, y]; el mas nuevo en el indice 0
+        self.waves = []    # impulsos; el mas nuevo en el indice 0
+        self.events = []
+
+    def pivot(self, s, i, x2, y2):
+        z = self.zz
+        if not z or z[0][0] != s:
+            z.insert(0, [s, x2, y2])
+            del z[12:]
+        elif s * y2 > s * z[0][2]:
+            z[0][1], z[0][2] = x2, y2          # el ultimo extremo se extiende
+        else:
+            return                             # el zigzag no cambio
+        if len(z) < 6:
+            return
+
+        X = [z[k][1] for k in range(5, -1, -1)]    # puntos 1..6
+        R = [z[k][2] for k in range(5, -1, -1)]
+        Y = [s * v for v in R]                     # multiplicado por s: una sola logica
+
+        # ---- impulso 1-2-3-4-5 ----
+        w1, w3, w5 = Y[1] - Y[0], Y[3] - Y[2], Y[5] - Y[4]
+        is_wave = w3 != min(w1, w3, w5) and Y[5] > Y[3] and Y[2] > Y[0] and Y[4] > Y[1]
+        cur = self.waves[0] if self.waves else None
+        same = cur is not None and cur["X"][:4] == X[:4]
+        if is_wave:
+            if same:
+                cur["X"][5], cur["R"][5] = X[5], R[5]
+            else:
+                self.waves.insert(0, dict(dir=s, X=X[:], R=R[:], on=True, abc=None, next=False))
+                del self.waves[15:]
+        elif same and cur["on"]:
+            cur["on"] = False                      # impulso invalidado
+
+        cur = self.waves[0] if self.waves else None
+        if cur is None or not cur["on"]:
+            return
+
+        # ---- correccion (a)(b)(c) contra el impulso ----
+        if cur["dir"] == -s:
+            diff = abs(cur["R"][5] - cur["R"][0])
+            gy = s * cur["R"][5]
+            same2 = X[0] == cur["X"][3] and X[1] == cur["X"][4] and X[2] == cur["X"][5]
+            valid = (X[2] == cur["X"][5] and Y[5] < gy + diff * FIB
+                     and Y[3] < gy + diff * FIB and Y[4] > gy)
+            abc = cur["abc"]
+            width = X[5] - X[1]
+            if valid:
+                if same2 and abc and abc["a"] > X[2]:
+                    abc.update(c=X[5], top=R[5], right=X[5] + width)
+                else:
+                    cur["abc"] = dict(a=X[3], c=X[5], top=R[5], bottom=R[3],
+                                      right=X[5] + width, ok=True)
+            elif same2 and abc and abc["a"] > X[2]:
+                abc["ok"] = False                  # correccion invalidada: no vuelve a avisar
+
+        # ---- circulo: el precio supera el extremo de (5) tras la correccion ----
+        abc = cur["abc"]
+        if cur["dir"] == s and not cur["next"] and abc and abc["ok"]:
+            if X[4] == abc["c"] and Y[5] > s * cur["R"][5]:
+                cur["next"] = True
+                self.events.append(Event(i, i - 1, "circle", s, R[5]))
+
+    def check_break(self, i, hi, lo):
+        """Cruz: el precio rompe la caja de la correccion mientras la vela este dentro de su ancho."""
+        if not self.waves:
+            return
+        w = self.waves[0]
+        abc = w["abc"]
+        if not abc or not abc["ok"] or i > abc["right"]:
+            return
+        if w["dir"] == 1:
+            lvl = abc["bottom"]
+            if lo[i] < lvl <= lo[i - 1]:
+                self.events.append(Event(i, i, "cross", -1, lvl))
+        else:
+            lvl = abc["top"]
+            if hi[i - 1] <= lvl < hi[i]:
+                self.events.append(Event(i, i, "cross", 1, lvl))
+
+
+def analyze(candles):
+    """candles: [(t, o, h, l, c)] solo cerradas. Devuelve los grados con sus eventos."""
+    hi = [c[2] for c in candles]
+    lo = [c[3] for c in candles]
+    degs = [Degree(n) for n in LENGTHS]
+    for i in range(1, len(candles)):
+        for d in degs:
+            if is_pivot_high(hi, i, d.left):
+                d.pivot(1, i, i - 1, hi[i - 1])
+            if is_pivot_low(lo, i, d.left):
+                d.pivot(-1, i, i - 1, lo[i - 1])
+            d.check_break(i, hi, lo)
+    return degs
+
+
+# ------------------------------------------------------------------
+#  Binance (datos publicos, sin API key)
+# ------------------------------------------------------------------
+class Binance:
+    def __init__(self, market):
+        if market == "futures":
+            self.bases = ["https://fapi.binance.com"]
+            self.k, self.t = "/fapi/v1/klines", "/fapi/v1/ticker/24hr"
+        else:
+            self.bases = ["https://data-api.binance.vision", "https://api.binance.com",
+                          "https://api1.binance.com", "https://api-gcp.binance.com"]
+            self.k, self.t = "/api/v3/klines", "/api/v3/ticker/24hr"
+        self.http = requests.Session()
+
+    def get(self, path, params=None):
+        err = "sin respuesta"
+        for _ in range(2):
+            for base in list(self.bases):
+                try:
+                    r = self.http.get(base + path, params=params, timeout=20)
+                except requests.RequestException as e:
+                    err = str(e)
+                    continue
+                if r.status_code == 200:
+                    self.bases.remove(base)
+                    self.bases.insert(0, base)     # recuerda el host que funciona
+                    return r.json()
+                err = f"{base} -> HTTP {r.status_code}"
+                if r.status_code in (418, 429):
+                    time.sleep(min(int(r.headers.get("Retry-After", "5")), 30))
+        raise RuntimeError(err + (" (451 = Binance bloquea la region/IP del servidor)" if "451" in err else ""))
+
+    def top_symbols(self, n):
+        rows = []
+        for d in self.get(self.t):
+            s = d["symbol"]
+            if not s.endswith("USDT") or "_" in s or s[:-4] in STABLES:
+                continue
+            rows.append((float(d["quoteVolume"]), s))
+        rows.sort(reverse=True)
+        return [s for _, s in rows[:n]]
+
+    def klines(self, sym, tf, now_ms):
+        raw = self.get(self.k, {"symbol": sym, "interval": tf, "limit": CANDLES})
+        return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+                for r in raw if int(r[6]) < now_ms]      # solo velas ya cerradas
+
+
+def last_closed_open(tf, now_ms):
+    """Hora de apertura de la ultima vela que ya deberia estar cerrada."""
+    ms = TF_MS[tf]
+    off = WEEK_OFFSET if tf == "1w" else 0
+    return (now_ms - off) // ms * ms + off - ms
+
+
+# ------------------------------------------------------------------
+#  Telegram
+# ------------------------------------------------------------------
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for _ in range(3):
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+        if r.status_code == 429:
+            time.sleep(r.json().get("parameters", {}).get("retry_after", 5) + 1)
+            continue
+        if r.ok:
+            return
+        raise RuntimeError(f"Telegram: {r.text}")
+    raise RuntimeError("Telegram: demasiados reintentos")
+
+
+def format_signal(sym, tf, left, ev, candles):
+    pos = "ARRIBA" if ev.side == 1 else "ABAJO"
+    name = "CÍRCULO" if ev.kind == "circle" else "CRUZ"
+    icon = "○" if ev.kind == "circle" else "✕"
+    when = datetime.fromtimestamp(candles[ev.mark][0] / 1000, ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M")
+    color = DEGREE_COLOR.get(left, "")
+    return (f"{icon} {name} {pos}\n"
+            f"{sym} · {tf} · grado {left} {color}\n"
+            f"Sobre la vela de las {when} ({TZ})\n"
+            f"Nivel: {ev.level:g} | Cierre: {candles[ev.bar][4]:g}")
+
+
+def send_batched(blocks):
+    chunk, size = [], 0
+    for b in blocks:
+        if chunk and size + len(b) > 3500:
+            send_telegram("\n\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(b)
+        size += len(b) + 2
+    if chunk:
+        send_telegram("\n\n".join(chunk))
+
+
+# ------------------------------------------------------------------
+#  Ejecucion
+# ------------------------------------------------------------------
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=0, sort_keys=True)
+
+
+def run_once(client, state):
+    now = int(time.time() * 1000)
+    symbols = SYMBOLS or client.top_symbols(TOP_N)
+    blocks, pending = [], {}
+    for sym in symbols:
+        for tf in TIMEFRAMES:
+            key = f"{sym}|{tf}"
+            if state.get(key, 0) >= last_closed_open(tf, now):
+                continue                                  # no cerro vela nueva: no consulta
+            try:
+                candles = client.klines(sym, tf, now)
+            except Exception as e:
+                print(f"{key}: {e}")
+                continue
+            if len(candles) < 60:
+                continue
+            last, prev = candles[-1][0], state.get(key)
+            if prev is None:                              # primera vez: sin alertas viejas
+                state[key] = last
+                continue
+            for d in analyze(candles):
+                for ev in d.events:
+                    if candles[ev.bar][0] > prev and (SEND_CROSSES or ev.kind == "circle"):
+                        blocks.append(format_signal(sym, tf, d.left, ev, candles))
+            pending[key] = last
+    if blocks:
+        print(f"{len(blocks)} señal(es)")
+        send_batched(blocks)                              # si falla, el estado no avanza
+    state.update(pending)
+
+
+def main():
+    if "test" in sys.argv:
+        client = Binance(MARKET)
+        print("Top 5:", client.top_symbols(5))
+        send_telegram("✅ Prueba OK: Binance responde y Telegram te puede escribir.")
+        return
+    client = Binance(MARKET)
+    state = load_state()
+    if "--once" in sys.argv:
+        run_once(client, state)
+        save_state(state)
+        return
+    print("Bot en marcha. Ctrl+C para parar.")
+    while True:
+        try:
+            run_once(client, state)
+            save_state(state)
+        except Exception as e:
+            print("error:", e)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
