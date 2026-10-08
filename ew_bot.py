@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
+# ------------------------------------------------------------------------------
+# Elliott Wave alerts bot (Python port)
+#
+# Derivative work based on "Elliott Wave [LuxAlgo]" (c) LuxAlgo, published on
+# TradingView (https://es.tradingview.com/script/KvrhsPTp-Elliott-Wave-LuxAlgo/) under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+# International license (CC BY-NC-SA 4.0):
+#     https://creativecommons.org/licenses/by-nc-sa/4.0/
+#
+# Changes made to the original: rewritten from Pine Script to Python; drawings,
+# Fibonacci lines and box-break (cross) signals removed; only closed candles are
+# used; the bullish and bearish code paths were unified; circle signals are sent
+# to Telegram.
+#
+# This derivative is distributed under the same license (CC BY-NC-SA 4.0):
+# attribution required, NON-COMMERCIAL use only, share-alike. No warranty.
+# ------------------------------------------------------------------------------
 """
-Elliott Wave [LuxAlgo] -> alertas de CIRCULOS a Telegram (datos de Binance, sin login).
+Elliott Wave (port del indicador de LuxAlgo, CC BY-NC-SA 4.0) -> alertas de CIRCULOS a Telegram (datos de Binance, sin login).
 
 Dos señales:   ○ CIRCULO ARRIBA   ○ CIRCULO ABAJO
 (posicion del circulo respecto a la vela, igual que en TradingView)
@@ -12,6 +28,7 @@ Uso:
     python ew_bot.py --once   -> una pasada y termina (GitHub Actions)
     python ew_bot.py          -> continuo, sincronizado con el cierre de cada vela (PC / servidor)
 """
+import html
 import json
 import os
 import sys
@@ -35,7 +52,7 @@ EXCLUDE = set()                                # bases a excluir, ej. {"PEPE", "
 SYMBOLS = []                                   # vacio = automatico. O fija: ["BTCUSDT", "ETHUSDT"]
 REFRESH_HOURS = 24                             # la lista automatica se recalcula cada tantas horas
 TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]   # 1w = semanal
-LENGTHS = [4, 8, 16]                           # grados del zigzag (rojo, azul, blanco)
+LENGTHS = [4, 8, 16]                           # grados del zigzag (rojo, azul, verde)
 FIB = 0.854                                    # limite de la correccion ABC (nivel 4 del indicador)
 TZ = "UTC"                                     # zona horaria de los mensajes, ej. "America/New_York"
 CANDLES = 1000                                 # velas por consulta (maximo de Binance)
@@ -49,7 +66,7 @@ TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
 WEEK_OFFSET = 4 * 86_400_000                   # las velas semanales abren el lunes 00:00 UTC
 STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "EUR", "EURI", "AEUR",
            "PYUSD", "USD1", "USDE", "XUSD", "BFUSD", "RLUSD", "UST", "GBP", "TRY", "BRL"}
-DEGREE_COLOR = {4: "rojo", 8: "azul", 16: "blanco"}
+DEGREE_COLOR = {4: "rojo", 8: "azul", 16: "verde"}
 
 
 # ------------------------------------------------------------------
@@ -240,8 +257,10 @@ def next_close_ms(now_ms):
 # ------------------------------------------------------------------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
     for _ in range(3):
-        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+        r = requests.post(url, data=payload, timeout=20)
         if r.status_code == 429:
             time.sleep(r.json().get("parameters", {}).get("retry_after", 5) + 1)
             continue
@@ -251,19 +270,49 @@ def send_telegram(text):
     raise RuntimeError("Telegram: demasiados reintentos")
 
 
+# Cada indicador tiene su color e icono: se reconoce a simple vista en el chat.
+MODULES = {
+    "elliott": ("🟦 🌊", "ELLIOTT WAVE"),
+    "smc": ("🟧 🏛", "SMC"),            # se usara cuando sumemos Smart Money Concepts
+}
+TV_INTERVAL = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D", "1w": "W"}
+
+
+def tv_link(sym, tf):
+    suffix = ".P" if MARKET == "futures" else ""
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{sym}{suffix}&interval={TV_INTERVAL[tf]}"
+
+
+def card(module, headline, sym, tf, tag, rows):
+    """Tarjeta de alerta con formato (HTML de Telegram). La usan todos los indicadores."""
+    icon, name = MODULES[module]
+    lines = [f"{icon} <b>{name}</b>",
+             f"<b>{html.escape(headline)}</b>",
+             f"🪙 <b>{html.escape(sym)}</b> · ⏱ {tf}" + (f" · {html.escape(tag)}" if tag else "")]
+    lines += rows
+    lines.append(f'<a href="{tv_link(sym, tf)}">📈 Abrir gráfico</a>')
+    return "\n".join(lines)
+
+
 def fmt_time(ms, fmt="%Y-%m-%d %H:%M"):
     return datetime.fromtimestamp(ms / 1000, ZoneInfo(TZ)).strftime(fmt)
 
 
+DEGREE_ICON = {4: "🔴", 8: "🔵", 16: "🟢"}
+
+
 def format_signal(sym, tf, left, ev, candles, now_ms):
-    pos = "ARRIBA" if ev.side == 1 else "ABAJO"
+    up = ev.side == 1
     closed_ms = candles[ev.bar][0] + TF_MS[tf]          # momento en que cerro la vela que confirma
     lag = max(0, (now_ms - closed_ms) // 1000)
-    return (f"○ CÍRCULO {pos}\n"
-            f"{sym} · {tf} · grado {left} {DEGREE_COLOR.get(left, '')}\n"
-            f"Sobre la vela de las {fmt_time(candles[ev.mark][0])} ({TZ})\n"
-            f"Confirmó al cierre de las {fmt_time(closed_ms, '%H:%M:%S')} | demora: {lag // 60}m{lag % 60:02d}s\n"
-            f"Nivel: {ev.level:g} | Cierre: {candles[ev.bar][4]:g}")
+    headline = "○ CÍRCULO ⬆️ ARRIBA" if up else "○ CÍRCULO ⬇️ ABAJO"
+    tag = f"grado {left} {DEGREE_ICON.get(left, '')} ({DEGREE_COLOR.get(left, '')})"
+    rows = [
+        f"🕯 Sobre la vela: <code>{fmt_time(candles[ev.mark][0])}</code> ({html.escape(TZ)})",
+        f"✅ Confirmó <code>{fmt_time(closed_ms, '%H:%M:%S')}</code> · demora <code>{lag // 60}m{lag % 60:02d}s</code>",
+        f"📍 Nivel <code>{ev.level:g}</code> · Cierre <code>{candles[ev.bar][4]:g}</code>",
+    ]
+    return card("elliott", headline, sym, tf, tag, rows)
 
 
 def send_batched(blocks):
@@ -357,7 +406,7 @@ def main():
     client = Binance(MARKET)
     if "test" in sys.argv:
         print("Top 5:", client.top_symbols(5, 0))
-        send_telegram("✅ Prueba OK: Binance responde y Telegram te puede escribir.")
+        send_telegram("🟦 🌊 <b>ELLIOTT WAVE</b>\n✅ Prueba OK: Binance responde y Telegram te puede escribir.")
         return
     state = load_state()
     if "--once" in sys.argv:
