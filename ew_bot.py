@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------------------------
-# Elliott Wave alerts bot (Python port)
+# Crypto alerts bot: Elliott Wave + Smart Money Concepts + Supertrend -> Telegram
 #
-# Derivative work based on "Elliott Wave [LuxAlgo]" (c) LuxAlgo, published on
-# TradingView (https://es.tradingview.com/script/KvrhsPTp-Elliott-Wave-LuxAlgo/) under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0
-# International license (CC BY-NC-SA 4.0):
+# Elliott Wave and SMC modules are derivative works of "Elliott Wave [LuxAlgo]" and
+# "Smart Money Concepts" (c) LuxAlgo, published on TradingView under the Creative Commons
+# Attribution-NonCommercial-ShareAlike 4.0 International license (CC BY-NC-SA 4.0):
 #     https://creativecommons.org/licenses/by-nc-sa/4.0/
-#
-# Changes made to the original: rewritten from Pine Script to Python; drawings,
-# Fibonacci lines and box-break (cross) signals removed; only closed candles are
-# used; the bullish and bearish code paths were unified; circle signals are sent
-# to Telegram.
-#
-# This derivative is distributed under the same license (CC BY-NC-SA 4.0):
-# attribution required, NON-COMMERCIAL use only, share-alike. No warranty.
+# See NOTICE.md and the header of each mod_*.py file for the changes made.
+# This project is distributed under the same license: attribution, NON-COMMERCIAL use only,
+# share-alike. No warranty.
 # ------------------------------------------------------------------------------
 """
-Elliott Wave (port del indicador de LuxAlgo, CC BY-NC-SA 4.0) -> alertas de CIRCULOS a Telegram (datos de Binance, sin login).
+Bot de alertas (datos de Binance, sin login) con formato en Telegram.
 
-Dos señales:   ○ CIRCULO ARRIBA   ○ CIRCULO ABAJO
-(posicion del circulo respecto a la vela, igual que en TradingView)
+Modulos (cada uno en su archivo, aislados: si uno falla, los otros siguen):
+    mod_elliott.py     ○ CIRCULO ARRIBA / ABAJO                     (top 30, 5m a 1w)
+    mod_smc.py         BOS / CHoCH swing + ruptura de Swing OB     (top 10, 4h y 1d)
+    mod_supertrend.py  cambio de tendencia                          (top 10, 4h y 1d)
 
-Sin repintado: se calcula solo con velas CERRADAS; la señal se envia una vez y no se mueve.
+Sin repintado: se calcula solo con velas CERRADAS; cada señal se envia una vez y no se mueve.
 
 Uso:
     python ew_bot.py test     -> prueba Binance y Telegram
     python ew_bot.py --once   -> una pasada y termina (GitHub Actions)
-    python ew_bot.py          -> continuo, sincronizado con el cierre de cada vela (PC / servidor)
+    python ew_bot.py          -> continuo, sincronizado con el cierre de cada vela
 """
 import html
 import json
@@ -36,29 +33,37 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import NamedTuple
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import requests
+
+import mod_elliott
+import mod_smc
+import mod_supertrend
 
 # ===================== CONFIGURACION =====================
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "PEGA_AQUI_EL_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT", "PEGA_AQUI_TU_CHAT_ID")
 
 MARKET = os.getenv("MARKET", "spot")           # "spot" o "futures" (futures suele dar 451 en GitHub)
-TOP_N = 30                                     # maximo de monedas a vigilar
+TOP_N = 30                                     # monedas de la lista automatica (los modulos usan las primeras 'top')
 MIN_VOLUME_USDT = 100_000_000                  # volumen minimo en 24h (en USDT) para entrar a la lista
 EXCLUDE = set()                                # bases a excluir, ej. {"PEPE", "WIF"}
 SYMBOLS = []                                   # vacio = automatico. O fija: ["BTCUSDT", "ETHUSDT"]
 REFRESH_HOURS = 24                             # la lista automatica se recalcula cada tantas horas
-TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]   # 1w = semanal
-LENGTHS = [4, 8, 16]                           # grados del zigzag (rojo, azul, verde)
-FIB = 0.854                                    # limite de la correccion ABC (nivel 4 del indicador)
 TZ = "UTC"                                     # zona horaria de los mensajes, ej. "America/New_York"
 CANDLES = 1000                                 # velas por consulta (maximo de Binance)
 WORKERS = 8                                    # consultas en paralelo
 LAG_SECONDS = 3                                # modo continuo: espera tras el cierre de la vela
 STATE_FILE = "ew_state.json"
+
+# Modulos activos. Para apagar uno, borra su linea o pon "on": False.
+ACTIVE = [
+    {"mod": mod_elliott,    "on": True, "top": 30, "tfs": ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]},
+    {"mod": mod_smc,        "on": True, "top": 10, "tfs": ["4h", "1d"]},
+    {"mod": mod_supertrend, "on": True, "top": 10, "tfs": ["4h", "1d"]},
+]
 # =========================================================
 
 TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
@@ -66,115 +71,6 @@ TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
 WEEK_OFFSET = 4 * 86_400_000                   # las velas semanales abren el lunes 00:00 UTC
 STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "EUR", "EURI", "AEUR",
            "PYUSD", "USD1", "USDE", "XUSD", "BFUSD", "RLUSD", "UST", "GBP", "TRY", "BRL"}
-DEGREE_COLOR = {4: "rojo", 8: "azul", 16: "verde"}
-
-
-# ------------------------------------------------------------------
-#  Motor Elliott (port de la logica del indicador; solo lo necesario para los circulos)
-# ------------------------------------------------------------------
-class Event(NamedTuple):
-    bar: int       # vela cuyo cierre dispara la señal
-    mark: int      # vela donde TradingView dibuja el circulo
-    side: int      # +1 arriba de la vela | -1 debajo de la vela
-    level: float   # extremo que se supero
-
-
-def is_pivot_high(h, i, left):
-    """Pivote en la vela i-1 confirmado por la vela i (como ta.pivothigh(x, left, 1))."""
-    p = i - 1
-    if p < left:
-        return False
-    v = h[p]
-    return v > h[i] and all(v > h[p - k] for k in range(1, left + 1))
-
-
-def is_pivot_low(l, i, left):
-    p = i - 1
-    if p < left:
-        return False
-    v = l[p]
-    return v < l[i] and all(v < l[p - k] for k in range(1, left + 1))
-
-
-class Degree:
-    """Un grado del zigzag (len 4, 8 o 16). Alcista y bajista comparten codigo (s = +1 / -1)."""
-
-    def __init__(self, left):
-        self.left = left
-        self.zz = []       # [dir, x, y]; el mas nuevo en el indice 0
-        self.waves = []    # impulsos; el mas nuevo en el indice 0
-        self.events = []
-
-    def pivot(self, s, i, x2, y2):
-        z = self.zz
-        if not z or z[0][0] != s:
-            z.insert(0, [s, x2, y2])
-            del z[12:]
-        elif s * y2 > s * z[0][2]:
-            z[0][1], z[0][2] = x2, y2          # el ultimo extremo se extiende
-        else:
-            return                             # el zigzag no cambio
-        if len(z) < 6:
-            return
-
-        X = [z[k][1] for k in range(5, -1, -1)]    # puntos 1..6
-        R = [z[k][2] for k in range(5, -1, -1)]
-        Y = [s * v for v in R]                     # multiplicado por s: una sola logica
-
-        # ---- impulso 1-2-3-4-5 ----
-        w1, w3, w5 = Y[1] - Y[0], Y[3] - Y[2], Y[5] - Y[4]
-        is_wave = w3 != min(w1, w3, w5) and Y[5] > Y[3] and Y[2] > Y[0] and Y[4] > Y[1]
-        cur = self.waves[0] if self.waves else None
-        same = cur is not None and cur["X"][:4] == X[:4]
-        if is_wave:
-            if same:
-                cur["X"][5], cur["R"][5] = X[5], R[5]
-            else:
-                self.waves.insert(0, dict(dir=s, X=X[:], R=R[:], on=True, abc=None, next=False))
-                del self.waves[15:]
-        elif same and cur["on"]:
-            cur["on"] = False                      # impulso invalidado
-
-        cur = self.waves[0] if self.waves else None
-        if cur is None or not cur["on"]:
-            return
-
-        # ---- correccion (a)(b)(c) contra el impulso ----
-        if cur["dir"] == -s:
-            diff = abs(cur["R"][5] - cur["R"][0])
-            gy = s * cur["R"][5]
-            same2 = X[0] == cur["X"][3] and X[1] == cur["X"][4] and X[2] == cur["X"][5]
-            valid = (X[2] == cur["X"][5] and Y[5] < gy + diff * FIB
-                     and Y[3] < gy + diff * FIB and Y[4] > gy)
-            abc = cur["abc"]
-            if valid:
-                if same2 and abc and abc["a"] > X[2]:
-                    abc["c"] = X[5]                # (c) se extiende
-                else:
-                    cur["abc"] = dict(a=X[3], c=X[5], ok=True)
-            elif same2 and abc and abc["a"] > X[2]:
-                abc["ok"] = False                  # correccion invalidada: ya no avisa
-
-        # ---- circulo: el precio supera el extremo de (5) tras la correccion ----
-        abc = cur["abc"]
-        if cur["dir"] == s and not cur["next"] and abc and abc["ok"]:
-            if X[4] == abc["c"] and Y[5] > s * cur["R"][5]:
-                cur["next"] = True
-                self.events.append(Event(i, i - 1, s, R[5]))
-
-
-def analyze(candles):
-    """candles: [(t, o, h, l, c)] solo cerradas. Devuelve los grados con sus eventos."""
-    hi = [c[2] for c in candles]
-    lo = [c[3] for c in candles]
-    degs = [Degree(n) for n in LENGTHS]
-    for i in range(1, len(candles)):
-        for d in degs:
-            if is_pivot_high(hi, i, d.left):
-                d.pivot(1, i, i - 1, hi[i - 1])
-            if is_pivot_low(lo, i, d.left):
-                d.pivot(-1, i, i - 1, lo[i - 1])
-    return degs
 
 
 # ------------------------------------------------------------------
@@ -242,18 +138,21 @@ def last_closed_open(tf, now_ms):
 
 
 def next_close_ms(now_ms):
-    """Proximo instante en que cierra alguna vela de los timeframes configurados."""
+    """Proximo instante en que cierra alguna vela de los timeframes activos."""
     best = None
-    for tf in TIMEFRAMES:
-        ms = TF_MS[tf]
-        off = WEEK_OFFSET if tf == "1w" else 0
-        t = (now_ms - off) // ms * ms + off + ms
-        best = t if best is None else min(best, t)
+    for m in ACTIVE:
+        if not m["on"]:
+            continue
+        for tf in m["tfs"]:
+            ms = TF_MS[tf]
+            off = WEEK_OFFSET if tf == "1w" else 0
+            t = (now_ms - off) // ms * ms + off + ms
+            best = t if best is None else min(best, t)
     return best
 
 
 # ------------------------------------------------------------------
-#  Telegram
+#  Telegram (formato HTML)
 # ------------------------------------------------------------------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -271,9 +170,10 @@ def send_telegram(text):
 
 
 # Cada indicador tiene su color e icono: se reconoce a simple vista en el chat.
-MODULES = {
+STYLES = {
     "elliott": ("🟦 🌊", "ELLIOTT WAVE"),
-    "smc": ("🟧 🏛", "SMC"),            # se usara cuando sumemos Smart Money Concepts
+    "smc": ("🟧 🏛", "SMC · SMART MONEY"),
+    "supertrend": ("🟪 📈", "SUPERTREND"),
 }
 TV_INTERVAL = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D", "1w": "W"}
 
@@ -283,9 +183,13 @@ def tv_link(sym, tf):
     return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{sym}{suffix}&interval={TV_INTERVAL[tf]}"
 
 
+def fmt_time(ms, fmt="%Y-%m-%d %H:%M"):
+    return datetime.fromtimestamp(ms / 1000, ZoneInfo(TZ)).strftime(fmt)
+
+
 def card(module, headline, sym, tf, tag, rows):
-    """Tarjeta de alerta con formato (HTML de Telegram). La usan todos los indicadores."""
-    icon, name = MODULES[module]
+    """Tarjeta de alerta con formato (HTML de Telegram). La usan todos los modulos."""
+    icon, name = STYLES[module]
     lines = [f"{icon} <b>{name}</b>",
              f"<b>{html.escape(headline)}</b>",
              f"🪙 <b>{html.escape(sym)}</b> · ⏱ {tf}" + (f" · {html.escape(tag)}" if tag else "")]
@@ -294,25 +198,8 @@ def card(module, headline, sym, tf, tag, rows):
     return "\n".join(lines)
 
 
-def fmt_time(ms, fmt="%Y-%m-%d %H:%M"):
-    return datetime.fromtimestamp(ms / 1000, ZoneInfo(TZ)).strftime(fmt)
-
-
-DEGREE_ICON = {4: "🔴", 8: "🔵", 16: "🟢"}
-
-
-def format_signal(sym, tf, left, ev, candles, now_ms):
-    up = ev.side == 1
-    closed_ms = candles[ev.bar][0] + TF_MS[tf]          # momento en que cerro la vela que confirma
-    lag = max(0, (now_ms - closed_ms) // 1000)
-    headline = "○ CÍRCULO ⬆️ ARRIBA" if up else "○ CÍRCULO ⬇️ ABAJO"
-    tag = f"grado {left} {DEGREE_ICON.get(left, '')} ({DEGREE_COLOR.get(left, '')})"
-    rows = [
-        f"🕯 Sobre la vela: <code>{fmt_time(candles[ev.mark][0])}</code> ({html.escape(TZ)})",
-        f"✅ Confirmó <code>{fmt_time(closed_ms, '%H:%M:%S')}</code> · demora <code>{lag // 60}m{lag % 60:02d}s</code>",
-        f"📍 Nivel <code>{ev.level:g}</code> · Cierre <code>{candles[ev.bar][4]:g}</code>",
-    ]
-    return card("elliott", headline, sym, tf, tag, rows)
+# utilidades que reciben los modulos
+HELPERS = SimpleNamespace(card=card, fmt_time=fmt_time, esc=html.escape, TF_MS=TF_MS, TZ=TZ)
 
 
 def send_batched(blocks):
@@ -342,6 +229,11 @@ def save_state(state):
         json.dump(state, f, indent=0, sort_keys=True)
 
 
+def state_key(module, sym, tf):
+    # Elliott conserva su clave original para no perder el estado ya guardado
+    return f"{sym}|{tf}" if module.NAME == "elliott" else f"{module.NAME}|{sym}|{tf}"
+
+
 def get_symbols(client, state, now):
     if SYMBOLS:
         return SYMBOLS
@@ -362,11 +254,15 @@ def get_symbols(client, state, now):
 def run_once(client, state):
     """Devuelve cuantas series aun no tienen publicada su ultima vela cerrada (para reintentar)."""
     now = int(time.time() * 1000)
-    jobs = []
-    for sym in get_symbols(client, state, now):
-        for tf in TIMEFRAMES:
-            if state.get(f"{sym}|{tf}", 0) < last_closed_open(tf, now):   # cerro una vela nueva
-                jobs.append((sym, tf))
+    symbols = get_symbols(client, state, now)
+    jobs = {}                                             # (simbolo, tf) -> modulos que lo necesitan
+    for m in ACTIVE:
+        if not m["on"]:
+            continue
+        for sym in symbols[:m["top"]]:
+            for tf in m["tfs"]:
+                if state.get(state_key(m["mod"], sym, tf), 0) < last_closed_open(tf, now):
+                    jobs.setdefault((sym, tf), []).append(m["mod"])
 
     def fetch(job):
         try:
@@ -376,28 +272,32 @@ def run_once(client, state):
 
     blocks, pending, stale = [], {}, 0
     with ThreadPoolExecutor(WORKERS) as pool:
-        for (sym, tf), candles, err in pool.map(fetch, jobs):
-            key = f"{sym}|{tf}"
+        for (sym, tf), candles, err in pool.map(fetch, list(jobs)):
             if err:
-                print(f"{key}: {err}")
+                print(f"{sym}|{tf}: {err}")
                 continue
             if len(candles) < 60:
                 continue
             if candles[-1][0] < last_closed_open(tf, now):
-                stale += 1                                    # Binance aun no publica la vela
+                stale += 1                                # Binance aun no publica la vela
                 continue
-            last, prev = candles[-1][0], state.get(key)
-            if prev is None:                                  # primera vez: sin alertas viejas
-                state[key] = last
-                continue
-            for d in analyze(candles):
-                for ev in d.events:
-                    if candles[ev.bar][0] > prev:
-                        blocks.append(format_signal(sym, tf, d.left, ev, candles, now))
-            pending[key] = last
+            last = candles[-1][0]
+            for mod in jobs[(sym, tf)]:                   # cada modulo va aislado de los demas
+                key = state_key(mod, sym, tf)
+                prev = state.get(key)
+                if prev is None:                          # primera vez: sin alertas viejas
+                    state[key] = last
+                    continue
+                try:
+                    for ev in mod.analyze(candles):
+                        if candles[ev["bar"]][0] > prev:
+                            blocks.append(mod.format(ev, sym, tf, candles, now, HELPERS))
+                    pending[key] = last
+                except Exception as e:
+                    print(f"{mod.NAME} {sym}|{tf}: error {e!r}")
     if blocks:
         print(f"{len(blocks)} señal(es)")
-        send_batched(blocks)                                  # si falla, el estado no avanza
+        send_batched(blocks)                              # si falla, el estado no avanza
     state.update(pending)
     return stale
 
@@ -406,7 +306,8 @@ def main():
     client = Binance(MARKET)
     if "test" in sys.argv:
         print("Top 5:", client.top_symbols(5, 0))
-        send_telegram("🟦 🌊 <b>ELLIOTT WAVE</b>\n✅ Prueba OK: Binance responde y Telegram te puede escribir.")
+        send_telegram("🟦 🌊 <b>ELLIOTT WAVE</b> · 🟧 🏛 <b>SMC</b> · 🟪 📈 <b>SUPERTREND</b>\n"
+                      "✅ Prueba OK: Binance responde y Telegram te puede escribir.")
         return
     state = load_state()
     if "--once" in sys.argv:
@@ -418,7 +319,7 @@ def main():
         wait = 0
         try:
             if run_once(client, state):
-                wait = 5                                      # reintenta en 5 s si falta publicar una vela
+                wait = 5                                  # reintenta en 5 s si falta publicar una vela
             save_state(state)
         except Exception as e:
             print("error:", e)
